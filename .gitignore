@@ -1,0 +1,29 @@
+# Build output
+/bbcore
+/bbcore.exe
+/dist/
+
+# Local runtime data (accounts, cookies, WBI cache)
+/.bbcore/
+/.bbcore-probe/
+/state.json
+/wbi.json
+
+# Probe output
+/probe-report.json
+
+# Local reference checkout, not part of this repository
+/reference/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.DS_Store
+*.log
