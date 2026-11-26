@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/cloudflypeng/bbcore/internal/events"
 )
 
 func TestParseParamsObject(t *testing.T) {
@@ -135,5 +138,81 @@ func TestServerContentLengthFraming(t *testing.T) {
 	}
 	if string(resp.ID) != "7" || resp.Error != nil {
 		t.Fatalf("unexpected response: %+v", resp)
+	}
+}
+
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func TestServerWritesHubNotifications(t *testing.T) {
+	hub := events.New(events.Options{Buffer: 8, History: 8})
+	out := &lockedBuffer{}
+	server := NewServer(out, nil, 2)
+	server.SetEventHub(hub)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server.startEventPump(ctx)
+	hub.Publish("live.connected", map[string]any{"room_id": 6})
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+		if len(lines) > 0 && lines[0] != "" {
+			var notification Notification
+			if err := json.Unmarshal([]byte(lines[0]), &notification); err != nil {
+				t.Fatalf("bad notification %q: %v", lines[0], err)
+			}
+			if notification.Method != "event.live.connected" {
+				t.Fatalf("method = %q", notification.Method)
+			}
+			params, ok := notification.Params.(map[string]any)
+			if !ok || params["seq"] != float64(1) {
+				t.Fatalf("params = %#v", notification.Params)
+			}
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for hub notification")
+}
+
+func TestServerCall(t *testing.T) {
+	server := NewServer(os.Stdout, os.Stderr, 2)
+	server.Register("echo", func(ctx context.Context, params json.RawMessage) (any, *Error) {
+		return map[string]any{"params": string(params)}, nil
+	})
+	server.Register("boom", func(ctx context.Context, params json.RawMessage) (any, *Error) {
+		panic("test panic")
+	})
+
+	result, rpcErr := server.Call(context.Background(), "echo", json.RawMessage(`{"n":1}`))
+	if rpcErr != nil {
+		t.Fatalf("Call echo: %v", rpcErr)
+	}
+	if payload, ok := result.(map[string]any); !ok || payload["params"] != `{"n":1}` {
+		t.Fatalf("result = %#v", result)
+	}
+
+	if _, rpcErr := server.Call(context.Background(), "missing", nil); rpcErr == nil || rpcErr.Code != CodeMethodNotFound {
+		t.Fatalf("missing method error = %#v", rpcErr)
+	}
+
+	if _, rpcErr := server.Call(context.Background(), "boom", nil); rpcErr == nil || rpcErr.Code != CodeInternalError {
+		t.Fatalf("panic error = %#v", rpcErr)
 	}
 }

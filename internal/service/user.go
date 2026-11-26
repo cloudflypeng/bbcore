@@ -3,8 +3,10 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/cloudflypeng/bbcore/internal/bili"
 	"github.com/cloudflypeng/bbcore/internal/jsonrpc"
@@ -23,7 +25,11 @@ func (s *Service) registerUser() {
 	s.add("user.later.clear", "Clear watch later", s.userLaterClear)
 	s.add("user.followings", "Following list (params: vmid, pn, ps)", s.userFollowings)
 	s.add("user.followers", "Follower list (params: vmid, pn, ps)", s.userFollowers)
+	s.add("user.follow_tags", "Following groups with counts", s.userFollowTags)
+	s.add("user.follow_tag_members", "Following group members (params: tagid, pn, ps, order_type)", s.userFollowTagMembers)
+	s.add("user.follow_search", "Search followings (params: name, pn, ps)", s.userFollowSearch)
 	s.add("user.follow", "Follow/unfollow (params: fid, follow)", s.userFollow)
+	s.add("user.relation", "Relationship with a user (params: mid or fid)", s.userRelation)
 	s.add("user.blacklist", "Blacklist (params: pn, ps)", s.userBlacklist)
 	s.add("user.folders", "Created favourite folders (params: mid default self)", s.userFolders)
 	s.add("user.sub_folders", "Collected favourite folders (params: mid default self)", s.userSubFolders)
@@ -59,7 +65,25 @@ func (s *Service) userInfo(ctx context.Context, raw json.RawMessage) (any, *json
 			"referer": "https://space.bilibili.com/" + stringify(mid) + "/dynamic",
 		},
 	})
-	return result, err
+	if err != nil {
+		return result, err
+	}
+	if upstreamCode(result) == 0 {
+		return result, nil
+	}
+	// The space info endpoint is periodically challenged by risk control even
+	// when the card endpoint succeeds; synthesize a profile-shaped response.
+	card, cardErr := s.endpointRequest(ctx, "memberCardInfo", requestOptions{
+		account: accountRef(p),
+		query:   url.Values{"mid": {stringify(mid)}, "photo": {"false"}},
+	})
+	if cardErr != nil {
+		return result, nil
+	}
+	if info, ok := memberInfoFromCard(mid, card); ok {
+		return info, nil
+	}
+	return result, nil
 }
 
 func (s *Service) userStat(ctx context.Context, raw json.RawMessage) (any, *jsonrpc.Error) {
@@ -108,7 +132,7 @@ func (s *Service) userVideos(ctx context.Context, raw json.RawMessage) (any, *js
 	if special := p.String("special_type"); special != "" {
 		query.Set("special_type", special)
 	}
-	return s.endpointRequest(ctx, "searchArchive", requestOptions{
+	result, rpcErr := s.endpointRequest(ctx, "searchArchive", requestOptions{
 		account: accountRef(p),
 		query:   query,
 		headers: map[string]string{
@@ -116,6 +140,121 @@ func (s *Service) userVideos(ctx context.Context, raw json.RawMessage) (any, *js
 			"referer": "https://space.bilibili.com/" + stringify(mid),
 		},
 	})
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	if upstreamCode(result) == 0 || p.IntDefault("pn", 1) > 1 ||
+		p.String("keyword") != "" || p.String("special_type") != "" {
+		return result, nil
+	}
+	// The web archive list is sometimes risk-controlled for anonymous users.
+	// The app endpoint serves the first page without that challenge.
+	fallback, fallbackErr := s.endpointRequest(ctx, "spaceArchive", requestOptions{
+		account: accountRef(p),
+		query: values(map[string]any{
+			"vmid": mid, "ps": p.IntDefault("ps", 30),
+			"order": p.StringDefault("order", "pubdate"), "type": "all",
+		}),
+	})
+	if fallbackErr != nil {
+		return result, nil
+	}
+	if normalized, ok := normalizeSpaceArchive(mid, fallback); ok {
+		return normalized, nil
+	}
+	return result, nil
+}
+
+func upstreamCode(result any) int64 {
+	root, ok := result.(map[string]any)
+	if !ok {
+		return -1
+	}
+	code, ok := root["code"]
+	if !ok {
+		return -1
+	}
+	return toInt64(code)
+}
+
+func memberInfoFromCard(mid int64, result any) (any, bool) {
+	root, ok := result.(map[string]any)
+	if !ok || toInt64(root["code"]) != 0 {
+		return nil, false
+	}
+	data, _ := root["data"].(map[string]any)
+	card, _ := data["card"].(map[string]any)
+	name := stringField(card, "name")
+	if name == "" {
+		return nil, false
+	}
+	levelInfo, _ := card["level_info"].(map[string]any)
+	info := map[string]any{
+		"mid":       mid,
+		"name":      name,
+		"face":      stringField(card, "face"),
+		"sign":      stringField(card, "sign"),
+		"level":     numberField(levelInfo, "current_level"),
+		"top_photo": "",
+		"fans":      numberField(card, "fans"),
+		"attention": numberField(card, "attention"),
+	}
+	return map[string]any{
+		"code": 0, "message": "0", "ttl": 1, "data": info,
+	}, true
+}
+
+func normalizeSpaceArchive(mid int64, result any) (any, bool) {
+	root, ok := result.(map[string]any)
+	if !ok || toInt64(root["code"]) != 0 {
+		return nil, false
+	}
+	data, _ := root["data"].(map[string]any)
+	items, _ := data["item"].([]any)
+	vlist := make([]any, 0, len(items))
+	for _, raw := range items {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		bvid := stringField(item, "bvid")
+		if bvid == "" {
+			continue
+		}
+		vlist = append(vlist, map[string]any{
+			"aid":          numberField(item, "param"),
+			"bvid":         bvid,
+			"title":        stringField(item, "title"),
+			"pic":          stringField(item, "cover"),
+			"author":       stringField(item, "author"),
+			"length":       formatLength(numberField(item, "duration")),
+			"description":  stringField(item, "subtitle"),
+			"play":         numberField(item, "play"),
+			"video_review": numberField(item, "danmaku"),
+			"created":      numberField(item, "ctime"),
+			"mid":          mid,
+		})
+	}
+	if len(vlist) == 0 {
+		return nil, false
+	}
+	return map[string]any{
+		"code": 0, "message": "0", "ttl": 1,
+		"data": map[string]any{
+			"list": map[string]any{"vlist": vlist, "tlist": []any{}, "slist": []any{}},
+			"page": map[string]any{"pn": 1, "ps": len(vlist), "count": numberField(data, "count")},
+		},
+	}, true
+}
+
+func formatLength(seconds int64) string {
+	if seconds <= 0 {
+		return ""
+	}
+	if seconds >= 3600 {
+		return fmt.Sprintf("%d:%02d:%02d", seconds/3600, seconds%3600/60, seconds%60)
+	}
+	return fmt.Sprintf("%d:%02d", seconds/60, seconds%60)
 }
 
 func (s *Service) userHistory(ctx context.Context, raw json.RawMessage) (any, *jsonrpc.Error) {
@@ -205,6 +344,51 @@ func (s *Service) userFollowers(ctx context.Context, raw json.RawMessage) (any, 
 	return s.userRelationList(ctx, raw, "fans")
 }
 
+func (s *Service) userFollowTags(ctx context.Context, raw json.RawMessage) (any, *jsonrpc.Error) {
+	p, rpcErr := jsonrpc.ParseParams(raw)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	return s.endpointRequest(ctx, "followUpTag", requestOptions{account: accountRef(p)})
+}
+
+func (s *Service) userFollowTagMembers(ctx context.Context, raw json.RawMessage) (any, *jsonrpc.Error) {
+	p, rpcErr := jsonrpc.ParseParams(raw)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	tagID, ok := p.ID("tagid")
+	if !ok {
+		return nil, jsonrpc.Errorf(jsonrpc.CodeInvalidParams, "tagid is required")
+	}
+	return s.endpointQuery(ctx, "followUpGroup", p, values(map[string]any{
+		"tagid": tagID, "pn": p.IntDefault("pn", 1), "ps": p.IntDefault("ps", 20),
+		"order_type": p.StringDefault("order_type", ""),
+	}))
+}
+
+func (s *Service) userFollowSearch(ctx context.Context, raw json.RawMessage) (any, *jsonrpc.Error) {
+	p, rpcErr := jsonrpc.ParseParams(raw)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	name := strings.TrimSpace(p.String("name"))
+	if name == "" {
+		return nil, jsonrpc.Errorf(jsonrpc.CodeInvalidParams, "name is required")
+	}
+	mid := p.IntDefault("vmid", 0)
+	if mid <= 0 {
+		mid = s.opt.Store.ActiveMid()
+	}
+	if mid <= 0 {
+		return nil, jsonrpc.Errorf(jsonrpc.CodeInvalidParams, "vmid is required (no active account)")
+	}
+	return s.endpointQuery(ctx, "followSearch", p, values(map[string]any{
+		"vmid": mid, "name": name,
+		"pn": p.IntDefault("pn", 1), "ps": p.IntDefault("ps", 20),
+	}))
+}
+
 func (s *Service) userRelationList(ctx context.Context, raw json.RawMessage, endpoint string) (any, *jsonrpc.Error) {
 	p, rpcErr := jsonrpc.ParseParams(raw)
 	if rpcErr != nil {
@@ -259,6 +443,21 @@ func (s *Service) userFollow(ctx context.Context, raw json.RawMessage) (any, *js
 			"extend_content": `{"entity":"user","entity_id":` + stringify(fid) + `,"fp":"web"}`,
 		}),
 	})
+}
+
+func (s *Service) userRelation(ctx context.Context, raw json.RawMessage) (any, *jsonrpc.Error) {
+	p, rpcErr := jsonrpc.ParseParams(raw)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	mid, ok := p.ID("mid")
+	if !ok || mid <= 0 {
+		mid, ok = p.ID("fid")
+	}
+	if !ok || mid <= 0 {
+		return nil, jsonrpc.Errorf(jsonrpc.CodeInvalidParams, "mid is required")
+	}
+	return s.endpointQuery(ctx, "relation", p, url.Values{"fid": {stringify(mid)}})
 }
 
 func (s *Service) userBlacklist(ctx context.Context, raw json.RawMessage) (any, *jsonrpc.Error) {

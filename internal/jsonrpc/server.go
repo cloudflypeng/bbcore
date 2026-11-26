@@ -15,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/cloudflypeng/bbcore/internal/events"
 )
 
 // Standard JSON-RPC 2.0 error codes.
@@ -75,6 +77,10 @@ type Server struct {
 	handlers map[string]Handler
 	sem      chan struct{}
 	wg       sync.WaitGroup
+
+	hub      *events.Hub
+	token    string
+	pumpOnce sync.Once
 }
 
 // NewServer creates a server writing protocol messages to out and human logs to
@@ -91,9 +97,39 @@ func NewServer(out, logOut io.Writer, maxConcurrent int) *Server {
 	}
 }
 
+// SetEventHub attaches the event hub used by stdio notifications and the HTTP
+// SSE endpoint. It must be called before Serve/ServeHTTP starts.
+func (s *Server) SetEventHub(hub *events.Hub) {
+	s.hub = hub
+}
+
+// SetToken optionally protects the HTTP transport with a bearer token. The
+// empty token keeps the development transport unauthenticated.
+func (s *Server) SetToken(token string) {
+	s.token = token
+}
+
 // Register adds a method handler.
 func (s *Server) Register(method string, h Handler) {
 	s.handlers[method] = h
+}
+
+// Call invokes one registered method synchronously. It is used by embedded
+// transports that do not speak the stdio or HTTP framing.
+func (s *Server) Call(ctx context.Context, method string, params json.RawMessage) (result any, rpcErr *Error) {
+	h, ok := s.handlers[method]
+	if !ok {
+		return nil, Errorf(CodeMethodNotFound, "method not found: %s", method)
+	}
+	s.sem <- struct{}{}
+	defer func() { <-s.sem }()
+	defer func() {
+		if rec := recover(); rec != nil {
+			result = nil
+			rpcErr = Errorf(CodeInternalError, "panic: %v", rec)
+		}
+	}()
+	return h(ctx, params)
 }
 
 // Registered returns the sorted registered method names.
@@ -110,6 +146,33 @@ func (s *Server) Registered() []string {
 func (s *Server) WriteNotification(method string, params any) {
 	n := Notification{JSONRPC: "2.0", Method: method, Params: params}
 	s.writeJSON(n)
+}
+
+func (s *Server) startEventPump(ctx context.Context) {
+	if s.hub == nil {
+		return
+	}
+	s.pumpOnce.Do(func() {
+		ch, cancel := s.hub.Subscribe(nil, 0)
+		go func() {
+			defer cancel()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case ev, ok := <-ch:
+					if !ok {
+						return
+					}
+					s.WriteNotification("event."+ev.Topic, map[string]any{
+						"seq":  ev.Seq,
+						"ts":   ev.TS,
+						"data": ev.Data,
+					})
+				}
+			}
+		}()
+	})
 }
 
 func (s *Server) writeJSON(v any) {
@@ -143,6 +206,8 @@ func (s *Server) Logf(format string, args ...any) {
 // reliably interrupt a blocking read on stdio; ctx cancellation must be able
 // to stop Serve on its own.
 func (s *Server) Serve(ctx context.Context, r io.Reader) error {
+	s.startEventPump(ctx)
+
 	type message struct {
 		payload []byte
 		err     error

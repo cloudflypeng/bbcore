@@ -8,7 +8,7 @@
 
 - **单二进制**，Go 编写，无运行时依赖。
 - **stdio JSON-RPC 2.0**（NDJSON；输入同时兼容 LSP `Content-Length` 分帧），宿主进程 spawn 后即可调用。
-- **315 个 HTTP 接口全量注册**为 `bili.<名称>`，另有 125 个语义化高层方法。
+- **315 个 HTTP 接口全量注册**为 `bili.<名称>`，另有 127 个语义化高层方法。
 - 直播弹幕 **WebSocket** 客户端（zlib/brotli 解压、心跳、自动重连、事件推送）。
 - **gRPC** 原始透传 + 弹幕分段类型化解码。
 - **扫码登录 + Cookie 导入 + 多账号持久化**，每个请求可指定账号。
@@ -29,7 +29,7 @@
 
 ## 构建
 
-需要 Go 1.24+。
+需要 Go 1.26+（`go.mod` 通过 `tool` 指令固定 gomobile/gobind 版本）。
 
 ```bash
 go build -o bbcore ./cmd/bbcore
@@ -123,6 +123,26 @@ console.log(await call("search.suggest", { term: "初音" }));
 
 完整协议见 [docs/PROTOCOL.md](docs/PROTOCOL.md)。
 
+### iOS / 嵌入式宿主（gomobile）
+
+`mobile` 包把服务直接嵌进宿主进程，不需要子进程或 RPC 端口：
+
+```bash
+go tool gomobile bind -target=ios,iossimulator -o BTBCore.xcframework ./mobile
+```
+
+生成的 Swift / Objective-C 接口：
+
+| 接口 | 说明 |
+| --- | --- |
+| `MobileStart(dataDir, &error)` | 打开数据目录并启动服务；`bbcore` 已在运行时返回错误 |
+| `MobileCall(method, paramsJSON, &error)` | 同步执行一个方法，返回 JSON 结果；错误文本以 JSON-RPC 错误码开头 |
+| `MobileSetEventHandler(handler)` | 注册 `MobileEventHandlerProtocol.onEvent(_:)`，每个事件一条 JSON-RPC 通知字符串 |
+| `MobileStop()` | 停止服务、落盘状态 |
+| `MobileVersion()` | 编进框架的版本号 |
+
+事件格式与 stdio 传输一致（`{"jsonrpc":"2.0","method":"event.<topic>","params":{...}}`）。宿主应把数据目录放在 Application Support 下，开启文件保护并排除 iCloud 备份；播放用的 HLS 网关仍只绑定 `127.0.0.1`。
+
 ## 快速验证
 
 ```bash
@@ -182,10 +202,99 @@ bash test/smoke.sh ./bbcore
 ### 视频
 
 `video.recommend` `video.recommend_app` `video.hot` `video.rank` `video.info` `video.playurl` `video.play_info` `video.related` `video.relation` `video.tags` `video.online` `video.like` `video.coin` `video.triple` `video.dislike` `video.ai_conclusion`
+`stream.start` `stream.stop`
+`player.resolve` `player.progress` `video.subtitle_vtt`
+`history.delete` `history.clear` `history.pause` `history.status`
+`download.start` `download.list` `download.status` `download.pause` `download.resume` `download.remove` `download.url` `download.config`
+
+### 原生播放（HLS 网关）
+
+B 站 UGC 的 `video.playurl` 返回 DASH/fMP4：视频、音频分开，每路用 `SegmentBase` 指向一个带 `sidx` 索引的完整文件，AVPlayer 不能直接播放。`stream.start` 会：
+
+1. 选择 HEVC（优先）或 AVC 视频轨，以及码率最高的 AAC 音频轨；
+2. 读取 `sidx`，按 5 秒分段生成 HLS 媒体播放列表；
+3. 在 `127.0.0.1:0` 启动临时 HTTP 网关，把 `Range` 请求代理到 B 站 CDN，主地址失败时切换 `backupUrl`；
+4. 返回可直接交给 `AVPlayer` 的本地 master playlist URL。
+
+```json
+{"jsonrpc":"2.0","id":7,"method":"stream.start","params":{
+  "bvid":"BV1atse6EEfx","qn":80,"codec":"hevc"
+}}
+```
+
+```json
+{"session_id":"<32 位十六进制>",
+ "master_url":"http://127.0.0.1:<port>/s/<session>/master.m3u8",
+ "expires_at":1790000000,
+ "duration_ms":1265088,
+ "video":{"id":80,"codecid":12,"codecs":"hvc1.1.6.L150.90","width":1920,"height":1080,"bandwidth":922000,"segments":254},
+ "audio":{"id":30280,"codecs":"mp4a.40.2","bandwidth":179000,"segments":253}}
+```
+
+参数：`bvid` 必填；`cid` 可选，省略时按 `page`（默认 1）解析；`qn` 默认 80；`codec` 为 `hevc` 或 `avc`，默认 `hevc`；`audio_id` 可选；`account` 可选。
+
+`master_url` 只在本机有效，`session_id` 是随机能力令牌。会话默认保留 2 小时，访问播放列表或分片时会自动续期；播放结束应调用：
+
+```json
+{"jsonrpc":"2.0","id":8,"method":"stream.stop","params":{"session_id":"<session>"}}
+```
+
+网关不做转码，只重封装索引和代理字节范围；AV1（`codecid=13`）会被跳过。番剧/影视使用 `pgc.play`（`/p/` 网关，参数 `season_id`/`ep_id`，返回结构含剧集列表与权益原因），详见 [docs/PROTOCOL.md](docs/PROTOCOL.md#9-hls-播放网关)。
+
+### 下载与离线播放
+
+`download.start` 在数据目录的 `downloads/<job_id>/` 保存完整 fMP4 视频/音频和本地 HLS 播放列表，支持暂停、断点续传、删除与空间统计：
+
+```json
+{"jsonrpc":"2.0","id":12,"method":"download.start","params":{"bvid":"BV1atse6EEfx","qn":80,"title":"…"}}
+{"jsonrpc":"2.0","id":13,"method":"download.list"}
+```
+
+进度通过 `download.progress` / `download.completed` / `download.failed` 事件推送。完成后 `download.url` 返回 `http://127.0.0.1:<port>/d/<job_id>/master.m3u8`，`/d/` 网关从本地文件提供播放列表和 Range 读取，断网或重启核心后仍可播放。签名 URL 过期时 `download.resume` 会自动重新解析；清晰度变化会重建文件。详见 [docs/PROTOCOL.md](docs/PROTOCOL.md#93-下载与离线播放)。
+
+### 直播播放（/l/ 网关）
+
+`live.play` 为直播间创建 HLS 会话，返回房间信息、清晰度列表和可直接交给 `AVPlayer` 的地址：
+
+```json
+{"jsonrpc":"2.0","id":9,"method":"live.play","params":{"room_id":13360144,"qn":10000}}
+```
+
+```json
+{"playable":true,
+ "session_id":"<32 位十六进制>",
+ "playback_url":"http://127.0.0.1:<port>/l/<session>/playlist.m3u8",
+ "format":"fmp4","quality":{"qn":10000,"desc":"原画"},
+ "room":{"room_id":13360144,"title":"…","anchor_name":"…","online":1560,"live_status":1}}
+```
+
+`/l/` 网关每次请求都会重新读取上游直播播放列表并重写分片地址，只允许代理 B 站 CDN 域名，且只监听本机回环地址。未开播返回 `playable:false, reason:"not_live"`；上游只有 FLV 时返回 `reason:"hls_unavailable"`，不做转码。参数与错误原因详见 [docs/PROTOCOL.md](docs/PROTOCOL.md#91-直播播放)。
+
+### 播放器解析 / 进度 / 字幕
+
+`player.resolve` 一次返回详情、分 P、清晰度、编码、音频、字幕和续播点，供播放器直接构建清晰度菜单：
+
+```json
+{"jsonrpc":"2.0","id":9,"method":"player.resolve","params":{
+  "bvid":"BV1atse6EEfx","page":1,"qn":80,"codec":"hevc"
+}}
+```
+
+响应包含 `qualities[]`（`qn/label/codec/codecid/width/height/bandwidth`）、`audio[]`、`subtitles[]`、`resume_ms`、`default_qn` 和 `playable`。`qualities[].qn` 与 `codec` 可直接传给 `stream.start`。
+
+`player.progress` 上报心跳；匿名账号返回 `reported=false` 而不请求上游：
+
+```json
+{"jsonrpc":"2.0","id":10,"method":"player.progress","params":{
+  "bvid":"BV1atse6EEfx","cid":43750131546,"progress_ms":125000,"event":"heartbeat"
+}}
+```
+
+`video.subtitle_vtt` 把 B 站字幕 JSON 转成 WebVTT，只接受 B 站域名的 HTTPS 地址。历史管理新增 `history.delete`、`history.clear`、`history.pause`、`history.status`。协议细节见 [docs/PROTOCOL.md](docs/PROTOCOL.md#91-播放器辅助方法)。
 
 ### 用户 / 收藏
 
-`user.me` `user.info` `user.stat` `user.card` `user.videos` `user.history` `user.later` `user.later.add` `user.later.del` `user.later.clear` `user.followings` `user.followers` `user.follow` `user.blacklist` `user.folders` `user.sub_folders`
+`user.me` `user.info` `user.stat` `user.card` `user.videos` `user.history` `user.later` `user.later.add` `user.later.del` `user.later.clear` `user.followings` `user.followers` `user.follow_tags` `user.follow_tag_members` `user.follow_search` `user.follow` `user.blacklist` `user.folders` `user.sub_folders`
 
 `fav.all_folders` `fav.folders` `fav.info` `fav.list` `fav.add` `fav.remove` `fav.create_folder` `fav.edit_folder` `fav.delete_folder` `fav.clean`
 
@@ -193,11 +302,14 @@ bash test/smoke.sh ./bbcore
 
 `search.default` `search.all` `search.type` `search.suggest` `search.trending` `search.hot` `search.recommend`
 
+`video.weekly` `article.rank` `article.view` `article.info` `topic.detail` `topic.feed` `topic.square`
+
 `dynamic.feed` `dynamic.space` `dynamic.detail` `dynamic.like` `dynamic.opus`
 
 ### 直播
 
 `live.list` `live.following` `live.room_info` `live.room_info_h5` `live.info_user` `live.danmaku_info` `live.history` `live.super_chat` `live.send_msg` `live.connect` `live.disconnect` `live.rooms`
+`live.play`
 
 `live.connect` 后弹幕以 `event.live.message` 通知推送，无需轮询。
 
@@ -209,7 +321,7 @@ bash test/smoke.sh ./bbcore
 ### 消息 / 番剧 / 其它
 
 `msg.replies` `msg.ats` `msg.likes` `msg.like_detail` `msg.unread` `msg.system` `msg.update_cursor`
-`pgc.timeline` `pgc.info` `pgc.playurl` `pgc.rank` `pgc.season_rank` `pgc.status` `pgc.review` `pgc.review_action` `pgc.review_post` `pgc.review_modify` `pgc.review_delete` `pgc.follow`
+`pgc.timeline` `pgc.info` `pgc.playurl` `pgc.play` `pgc.rank` `pgc.season_rank` `pgc.status` `pgc.review` `pgc.review_action` `pgc.review_post` `pgc.review_modify` `pgc.review_delete` `pgc.follow`
 `misc.sponsor_segments` `misc.match_info` `misc.music_detail` `misc.music_recommend` `misc.music_wish` `misc.video_note`
 
 ### gRPC
@@ -235,9 +347,9 @@ bash test/smoke.sh ./bbcore
 
 ## 事件（服务端通知）
 
-无 `id` 的 JSON-RPC 通知：
+无 `id` 的 JSON-RPC 通知，统一信封为 `{"method":"event.<topic>","params":{"seq":N,"ts":...,"data":{...}}}`：
 
-| 方法 | 负载 |
+| 方法 | `data` 负载 |
 | --- | --- |
 | `event.live.connected` | `{room_id}` |
 | `event.live.disconnected` | `{room_id, reason}`（自动重连前发出） |
@@ -246,6 +358,8 @@ bash test/smoke.sh ./bbcore
 | `event.account.login` / `logout` / `removed` | `{mid, name?}` |
 
 `event.live.message` 的 `data` 是上游原始 JSON；`DANMU_MSG` 额外带 `danmaku` 摘要：`text`、`uid`、`uname`、`id`、`dm_type`、`fontsize`、`color`、`mode`。
+
+`seq` 单调递增；HTTP 模式可用 `GET /events?since=<seq>&topics=live.*` 通过 SSE 续传。`core.capabilities` 返回当前支持的功能开关与事件 topic。
 
 ## 数据与安全
 
@@ -258,7 +372,7 @@ bash test/smoke.sh ./bbcore
 ## 开发
 
 ```bash
-go test ./...        # 签名、分帧、protobuf、弹幕解析等单元测试
+go test ./...        # 签名、分帧、protobuf、弹幕解析、HLS 索引等单元测试
 bash test/smoke.sh   # 真实网络冒烟测试
 python3 test/probe_all.py --bin ./bbcore --data-dir ~/.bbcore  # 全量接口探测
 python3 tools/gen_endpoints.py   # 从 reference/PiliPlus/lib/http/api.dart 重新生成注册表
@@ -272,7 +386,8 @@ python3 tools/gen_endpoints.py   # 从 reference/PiliPlus/lib/http/api.dart 重�
 cmd/bbcore          进程入口（stdin/stdout 接线、信号处理、buvid 初始化）
 internal/bili       HTTP 传输、签名、Cookie、WBI、端点注册表
 internal/biligrpc   gRPC 传输与 protobuf 编解码
-internal/jsonrpc    JSON-RPC 2.0 + NDJSON/Content-Length 分帧
+internal/events     事件总线（seq、topic 过滤、回放、慢消费者丢弃）
+internal/jsonrpc    JSON-RPC 2.0 + NDJSON/Content-Length 分帧 + HTTP/SSE
 internal/live       直播弹幕 WebSocket
 internal/service    RPC 方法层（core/auth/api/各业务模块）
 internal/state      多账号持久化
@@ -287,6 +402,7 @@ docs/PROTOCOL.md    完整协议说明
 - 部分 APP 专用接口依赖客户端商业参数，`bili.<名称>` 已保证参数透传能力，必要时需宿主补齐。
 - 少量接口需要 APP access_key 或特定账号权限（如实名、直播推荐），仅导入 Web Cookie 时可能返回 `-101` / `-352`。
 - 上游已下线或受隐私限制的接口可能返回 404 / 22115，会原样透传。
+- `stream.start` 只处理 UGC 的 DASH 播放地址；不转码、不支持 AV1、PGC、字幕或弹幕。HLS 网关只监听本机回环地址，进程退出后自动关闭。
 
 ## 致谢与许可
 

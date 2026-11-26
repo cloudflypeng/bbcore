@@ -23,6 +23,7 @@ func (s *Service) registerCore() {
 		}, nil
 	})
 	s.add("core.info", "Runtime info (accounts, live rooms, counts)", s.coreInfo)
+	s.add("core.capabilities", "Feature and event capability discovery", s.coreCapabilities)
 	s.add("core.methods", "List RPC methods (params: prefix, include_endpoints)", s.coreMethods)
 	s.add("core.endpoints", "List extracted endpoint constants (params: q, base)", s.coreEndpoints)
 	s.add("core.endpoint", "Describe one endpoint (params: name)", s.coreEndpoint)
@@ -39,29 +40,72 @@ func (s *Service) coreInfo(ctx context.Context, raw json.RawMessage) (any, *json
 		}
 	}
 	out := map[string]any{
-		"name":        "bbcore",
-		"version":     Version,
-		"protocol":    1,
-		"data_dir":    s.opt.DataDir,
-		"accounts":    len(accounts),
-		"active_mid":  activeMid,
-		"active_name": activeName,
-		"endpoints":   len(bili.EndpointList),
-		"methods":     len(s.Methods()) + len(bili.EndpointList),
-		"notifications": []string{
-			"event.live.connected",
-			"event.live.disconnected",
-			"event.live.popularity",
-			"event.live.message",
-			"event.account.login",
-			"event.account.logout",
-			"event.account.removed",
-		},
+		"name":          "bbcore",
+		"version":       Version,
+		"protocol":      1,
+		"data_dir":      s.opt.DataDir,
+		"accounts":      len(accounts),
+		"active_mid":    activeMid,
+		"active_name":   activeName,
+		"endpoints":     len(bili.EndpointList),
+		"methods":       len(s.Methods()) + len(bili.EndpointList),
+		"notifications": serviceEventTopics(),
+	}
+	if s.opt.Events != nil {
+		out["event_stats"] = s.opt.Events.Stats()
 	}
 	if s.opt.Live != nil {
 		out["live_rooms"] = s.opt.Live.Rooms()
 	}
 	return out, nil
+}
+
+func (s *Service) coreCapabilities(ctx context.Context, raw json.RawMessage) (any, *jsonrpc.Error) {
+	return map[string]any{
+		"name":           "bbcore",
+		"version":        Version,
+		"protocol":       1,
+		"event_protocol": 1,
+		"methods":        len(s.Methods()) + len(bili.EndpointList),
+		"endpoints":      len(bili.EndpointList),
+		"events":         serviceEventTopics(),
+		"features": map[string]bool{
+			"events":          true,
+			"events.sse":      true,
+			"events.replay":   true,
+			"stream.hls":      true,
+			"stream.quality":  true,
+			"stream.codec":    true,
+			"stream.audio":    true,
+			"danmaku.read":    true,
+			"danmaku.send":    true,
+			"live.danmaku":    true,
+			"subtitles":       true,
+			"player.resolve":  true,
+			"player.progress": true,
+			"history.manage":  true,
+			"live.hls":        true,
+			"pgc.gateway":     true,
+			"im":              false,
+			"downloads":       true,
+			"downloads.hls":   true,
+		},
+	}, nil
+}
+
+func serviceEventTopics() []string {
+	return []string{
+		"event.live.connected",
+		"event.live.disconnected",
+		"event.live.popularity",
+		"event.live.message",
+		"event.account.login",
+		"event.account.logout",
+		"event.account.removed",
+		"event.download.progress",
+		"event.download.completed",
+		"event.download.failed",
+	}
 }
 
 func (s *Service) coreMethods(ctx context.Context, raw json.RawMessage) (any, *jsonrpc.Error) {

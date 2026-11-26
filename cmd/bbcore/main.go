@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -11,11 +12,13 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/cloudflypeng/bbcore/internal/bili"
 	"github.com/cloudflypeng/bbcore/internal/biligrpc"
+	"github.com/cloudflypeng/bbcore/internal/events"
 	"github.com/cloudflypeng/bbcore/internal/jsonrpc"
 	"github.com/cloudflypeng/bbcore/internal/live"
 	"github.com/cloudflypeng/bbcore/internal/service"
@@ -34,6 +37,8 @@ func run() error {
 		dataDir    = flag.String("data-dir", "", "state directory (default $BBCORE_DATA_DIR or ~/.bbcore)")
 		debug      = flag.Bool("debug", false, "log every upstream request (also env BBCORE_DEBUG)")
 		maxWorkers = flag.Int("max-concurrent", 32, "maximum concurrent RPC handlers")
+		listen     = flag.String("listen", "", "serve JSON-RPC over HTTP on this address (e.g. 127.0.0.1:8787) instead of stdio")
+		token      = flag.String("token", "", "optional bearer token for the HTTP transport (or env BBCORE_HTTP_TOKEN)")
 		showVer    = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
@@ -65,7 +70,16 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	hub := events.New(events.Options{})
 	server := jsonrpc.NewServer(os.Stdout, os.Stderr, *maxWorkers)
+	server.SetEventHub(hub)
+	httpToken := *token
+	if httpToken == "" {
+		httpToken = os.Getenv("BBCORE_HTTP_TOKEN")
+	}
+	if httpToken != "" {
+		server.SetToken(httpToken)
+	}
 
 	client := bili.NewClient(bili.Config{
 		CacheDir: dir,
@@ -96,7 +110,9 @@ func run() error {
 	}
 	cancelBoot()
 
-	emit := func(method string, params any) { server.WriteNotification(method, params) }
+	emit := func(method string, params any) {
+		hub.Publish(strings.TrimPrefix(method, "event."), params)
+	}
 	grpcClient := biligrpc.New(logger)
 	liveManager := live.NewManager(client, logger, emit)
 	svc := service.New(service.Options{
@@ -104,6 +120,7 @@ func run() error {
 		Store:   store,
 		Live:    liveManager,
 		Grpc:    grpcClient,
+		Events:  hub,
 		Logger:  logger,
 		DataDir: dir,
 		Stop: func() {
@@ -118,7 +135,31 @@ func run() error {
 		"data_dir", dir,
 		"methods", len(server.Registered()),
 	)
-	serveErr := server.Serve(runCtx, os.Stdin)
+	var serveErr error
+	if *listen != "" {
+		httpServer := &http.Server{
+			Addr:              *listen,
+			Handler:           server,
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		shutdownDone := make(chan struct{})
+		go func() {
+			defer close(shutdownDone)
+			<-runCtx.Done()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_ = httpServer.Shutdown(shutdownCtx)
+		}()
+		logger.Info("bbcore HTTP listening", "addr", *listen)
+		serveErr = httpServer.ListenAndServe()
+		if errors.Is(serveErr, http.ErrServerClosed) {
+			serveErr = nil
+		}
+		cancelRun()
+		<-shutdownDone
+	} else {
+		serveErr = server.Serve(runCtx, os.Stdin)
+	}
 	svc.Stop()
 	if err := store.Save(); err != nil {
 		logger.Warn("flush state", "error", err)

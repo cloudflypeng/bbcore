@@ -10,6 +10,8 @@ import (
 
 	"github.com/cloudflypeng/bbcore/internal/bili"
 	"github.com/cloudflypeng/bbcore/internal/biligrpc"
+	"github.com/cloudflypeng/bbcore/internal/download"
+	"github.com/cloudflypeng/bbcore/internal/events"
 	"github.com/cloudflypeng/bbcore/internal/jsonrpc"
 	"github.com/cloudflypeng/bbcore/internal/live"
 	"github.com/cloudflypeng/bbcore/internal/state"
@@ -31,6 +33,7 @@ type Options struct {
 	Store   *state.Store
 	Live    *live.Manager
 	Grpc    *biligrpc.Client
+	Events  *events.Hub
 	Logger  *slog.Logger
 	DataDir string
 	Stop    func()
@@ -42,6 +45,15 @@ type Service struct {
 	mu      sync.RWMutex
 	methods map[string]Method
 	notify  func(method string, params any)
+
+	streamMu sync.Mutex
+	streams  *streamGateway
+
+	castMu     sync.Mutex
+	activeCast *castSession
+
+	downloadMu sync.Mutex
+	downloads  *download.Manager
 }
 
 // New builds a service and registers all static methods.
@@ -56,15 +68,22 @@ func New(opt Options) *Service {
 	s.registerVideo()
 	s.registerUser()
 	s.registerSearch()
+	s.registerDiscover()
 	s.registerDynamic()
 	s.registerLive()
+	s.registerLivePlay()
 	s.registerReply()
 	s.registerDanmaku()
 	s.registerFav()
 	s.registerMsg()
 	s.registerPGC()
+	s.registerPGCPlay()
 	s.registerMisc()
 	s.registerGRPC()
+	s.registerStream()
+	s.registerPlayback()
+	s.registerDownload()
+	s.registerCast()
 	return s
 }
 
@@ -118,6 +137,18 @@ func (s *Service) Methods() []Method {
 
 // Stop shuts down background work.
 func (s *Service) Stop() {
+	s.streamMu.Lock()
+	if s.streams != nil {
+		s.streams.Close()
+		s.streams = nil
+	}
+	s.streamMu.Unlock()
+	s.downloadMu.Lock()
+	if s.downloads != nil {
+		s.downloads.Close()
+		s.downloads = nil
+	}
+	s.downloadMu.Unlock()
 	if s.opt.Live != nil {
 		s.opt.Live.Close()
 	}

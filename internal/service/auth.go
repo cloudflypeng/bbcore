@@ -25,6 +25,7 @@ func (s *Service) registerAuth() {
 	s.add("auth.account.remove", "Remove a stored account (params: mid)", s.authAccountRemove)
 	s.add("auth.account.info", "Fetch the live profile (nav) for an account", s.authAccountInfo)
 	s.add("auth.logout", "Log out upstream and remove the account", s.authLogout)
+	s.registerAuthSMS()
 }
 
 func (s *Service) authQRGenerate(ctx context.Context, raw json.RawMessage) (any, *jsonrpc.Error) {
